@@ -13,16 +13,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout my repository
+        uses: actions/checkout@v4
 
       - name: Clone Morphe patches
         run: |
           git clone --depth=1 https://github.com/MorpheApp/morphe-patches.git temp-morphe
 
-      - name: Copy to root
+      - name: Copy Morphe files to root
         run: |
-          shopt -s dotglob
-          cp -rf temp-morphe/* .
+          rsync -av \
+            --exclude='.git' \
+            --exclude='.github' \
+            temp-morphe/ ./
 
           rm -rf temp-morphe
 
