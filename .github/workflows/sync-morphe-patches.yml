@@ -1,9 +1,9 @@
 name: Sync Morphe patches
 
 on:
-  schedule:
-    - cron: "0 3 * * *" # 매일 12:00 KST
   workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
 
 permissions:
   contents: write
@@ -13,31 +13,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout my repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Clone Morphe patches
         run: |
-          rm -rf temp-morphe
           git clone --depth=1 https://github.com/MorpheApp/morphe-patches.git temp-morphe
 
-      - name: Copy files
+      - name: Copy to root
         run: |
-          rsync -av --delete \
-            --exclude='.git' \
-            temp-morphe/ ./
+          shopt -s dotglob
+          cp -rf temp-morphe/* .
 
           rm -rf temp-morphe
 
-      - name: Commit and push changes
+      - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if [[ -n $(git status --porcelain) ]]; then
-            git add .
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
             git commit -m "Sync Morphe patches"
             git push
-          else
-            echo "No changes to sync"
           fi
