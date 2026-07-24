@@ -5,19 +5,18 @@
  * Original hard forked code:
  * https://github.com/ReVanced/revanced-patches/commit/724e6d61b2ecd868c1a9a37d465a688e83a74799
  *
- * See the included NOTICE file for GPLv3 §7(b) and §7(c) terms that apply to Morphe contributions.
+ * See the included NOTICE file for GPLv3 Section 7 terms that apply to Morphe contributions.
  */
 
 package app.morphe.extension.shared.spoof.requests;
 
 import static app.morphe.extension.shared.StringRef.str;
 import static app.morphe.extension.shared.Utils.isNotEmpty;
+import static app.morphe.extension.shared.Utils.submitOnBackgroundThread;
 import static app.morphe.extension.shared.spoof.js.JavaScriptEngineSupport.supportsJavaScriptEngine;
 import static app.morphe.extension.shared.spoof.js.JavaScriptManager.getDeobfuscatedStreamingData;
 import static app.morphe.extension.shared.spoof.js.JavaScriptManager.getJavaScriptHash;
 import static app.morphe.extension.shared.spoof.js.JavaScriptManager.getJavaScriptVariant;
-import static app.morphe.extension.shared.spoof.requests.PlayerRoutes.GET_PLAYER_STREAMING_DATA;
-import static app.morphe.extension.shared.spoof.requests.PlayerRoutes.GET_REEL_STREAMING_DATA;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -27,11 +26,12 @@ import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -43,7 +43,6 @@ import app.morphe.extension.shared.innertube.PlayerResponseOuterClass.PlayerResp
 import app.morphe.extension.shared.innertube.PlayerResponseOuterClass.StreamingData;
 import app.morphe.extension.shared.innertube.ReelItemWatchResponseOuterClass.ReelItemWatchResponse;
 import app.morphe.extension.shared.oauth2.requests.OAuth2Requester;
-import app.morphe.extension.shared.requests.Route;
 import app.morphe.extension.shared.settings.BaseSettings;
 import app.morphe.extension.shared.settings.SharedYouTubeSettings;
 import app.morphe.extension.shared.spoof.ClientType;
@@ -59,38 +58,36 @@ import app.morphe.extension.shared.spoof.ClientType;
  */
 public class StreamingDataRequest {
 
+    public record StreamData(byte[] streamingData, @Nullable byte[] playerConfig) {
+    }
+
     private static volatile ClientType[] clientOrderToUse = ClientType.values();
 
     public static void setClientOrderToUse(List<ClientType> availableClients, ClientType preferredClient) {
         Objects.requireNonNull(preferredClient);
 
-        int availableClientSize = availableClients.size();
-        if (!availableClients.contains(preferredClient)) {
-            availableClientSize++;
-        }
+        List<ClientType> orderToUse = new ArrayList<>(availableClients.size());
+        orderToUse.add(preferredClient);
 
-        clientOrderToUse = new ClientType[availableClientSize];
-        clientOrderToUse[0] = preferredClient;
-
-        int i = 1;
-        for (ClientType c : availableClients) {
-            if (c.requireJS && !supportsJavaScriptEngine()) {
-                Logger.printDebug(() -> "Could not find JavaScript engine. Skipping JavaScript client: " + c.name());
+        for (ClientType client : availableClients) {
+            if (client.requireJS && !supportsJavaScriptEngine()) {
+                Logger.printDebug(() -> "Could not find JavaScript engine. Skipping JavaScript client: " + client.name());
                 continue;
             }
 
-            if (c != preferredClient) {
-                clientOrderToUse[i++] = c;
+            if (client != preferredClient) {
+                orderToUse.add(client);
             }
         }
 
-        Logger.printDebug(() -> "Available spoof clients: " + Arrays.toString(clientOrderToUse));
+        clientOrderToUse = orderToUse.toArray(new ClientType[0]);
+        Logger.printDebug(() -> "Available spoof clients: " + orderToUse);
     }
 
-    private static final String AUTHORIZATION_HEADER = "Authorization";
+    private static final String AUTHORIZATION_HEADER = "Authorization"; // Available only to logged-in users.
 
     private static final String[] REQUEST_HEADER_KEYS = {
-            AUTHORIZATION_HEADER, // Available only to logged-in users.
+            AUTHORIZATION_HEADER,
             "X-GOOG-API-FORMAT-VERSION",
             "X-Goog-Visitor-Id"
     };
@@ -135,14 +132,18 @@ public class StreamingDataRequest {
         }
     }
 
+    public static boolean getLastSpoofedClientUseSABR() {
+        ClientType client = lastSpoofedClientType;
+        return client != null && client.requireSABR;
+    }
+
     private final String videoId;
 
-    private final Future<byte[]> future;
+    private final Future<StreamData> future;
 
     private StreamingDataRequest(String videoId, Map<String, String> playerHeaders) {
-        Objects.requireNonNull(playerHeaders);
         this.videoId = videoId;
-        this.future = Utils.submitOnBackgroundThread(() -> fetch(videoId, playerHeaders));
+        this.future = submitOnBackgroundThread(() -> fetch(videoId, playerHeaders));
     }
 
     public static void fetchRequest(String videoId, Map<String, String> fetchHeaders) {
@@ -160,9 +161,15 @@ public class StreamingDataRequest {
         Logger.printInfo(() -> toastMessage, ex);
     }
 
-    private static void handleDebugToast(String toastMessage, ClientType clientType) {
+    private static void handleDebugToast(String toastMessage,
+                                         ClientType clientType) {
         if (BaseSettings.DEBUG.get() && BaseSettings.DEBUG_TOAST_ON_ERROR.get()) {
-            Utils.showToastShort(String.format(toastMessage, clientType));
+            Utils.showToastShort(
+                String.format(
+                    toastMessage,
+                    clientType
+                )
+            );
         }
     }
 
@@ -171,6 +178,8 @@ public class StreamingDataRequest {
                                           String videoId,
                                           Map<String, String> playerHeaders,
                                           boolean showErrorToasts) {
+        Utils.verifyOffMainThread();
+
         Objects.requireNonNull(clientType);
         Objects.requireNonNull(videoId);
         Objects.requireNonNull(playerHeaders);
@@ -178,8 +187,7 @@ public class StreamingDataRequest {
         final long startTime = System.currentTimeMillis();
 
         try {
-            Route.CompiledRoute route = clientType.usePlayerEndpoint ? GET_PLAYER_STREAMING_DATA : GET_REEL_STREAMING_DATA;
-            HttpURLConnection connection = PlayerRoutes.getPlayerResponseConnectionFromRoute(route, clientType);
+            HttpURLConnection connection = PlayerRoutes.getPlayerResponseConnectionFromRoute(clientType);
             connection.setConnectTimeout(HTTP_TIMEOUT_MILLISECONDS);
             connection.setReadTimeout(HTTP_TIMEOUT_MILLISECONDS);
 
@@ -219,11 +227,11 @@ public class StreamingDataRequest {
 
             if (!authHeadersIncludes && clientType.requireLogin) {
                 Logger.printDebug(() -> "Skipping client since user is not logged in: " + clientType
-                        + " videoId: " + videoId);
+                        + ", videoId: " + videoId);
                 return null;
             }
 
-            Logger.printDebug(() -> "Fetching video streams for: " + videoId + " using client: " + clientType);
+            Logger.printDebug(() -> "Fetching video stream for: " + videoId + " using client: " + clientType);
 
             String innerTubeBody = PlayerRoutes.createInnertubeBody(clientType, videoId);
             byte[] requestBody = innerTubeBody.getBytes(StandardCharsets.UTF_8);
@@ -231,6 +239,7 @@ public class StreamingDataRequest {
             connection.getOutputStream().write(requestBody);
 
             final int responseCode = connection.getResponseCode();
+
             if (responseCode == 200) return connection;
 
             // This situation likely means the patches are outdated.
@@ -252,8 +261,8 @@ public class StreamingDataRequest {
     }
 
     @Nullable
-    private static byte[] buildPlayerResponseBuffer(ClientType clientType,
-                                                    HttpURLConnection connection) {
+    private static StreamData buildPlayerResponseBuffer(ClientType clientType,
+                                                        HttpURLConnection connection) {
         // gzip encoding doesn't response with content length (-1),
         // but empty response body does.
         if (connection.getContentLength() == 0) {
@@ -266,8 +275,8 @@ public class StreamingDataRequest {
                     ? PlayerResponse.parseFrom(inputStream)
                     : ReelItemWatchResponse.parseFrom(inputStream).getPlayerResponse();
             var playabilityStatus = playerResponse.getPlayabilityStatus();
-            String status = playabilityStatus.getStatus().name();
 
+            String status = playabilityStatus.getStatus().name();
             if (!"OK".equals(status)) {
                 handleDebugToast("Debug: Ignoring unplayable video (%s)", clientType);
                 String reason = playabilityStatus.getReason();
@@ -303,28 +312,48 @@ public class StreamingDataRequest {
                 responseBuilder.setStreamingData(deobfuscatedStreamingData);
             }
 
-            return responseBuilder.build().toByteArray();
+            byte[] streamingDataBuffer = responseBuilder.build().toByteArray();
+            byte[] playerConfig = null;
+
+            if (clientType.requireSABR && playerResponse.hasPlayerConfig()) {
+                playerConfig = playerResponse.getPlayerConfig().toByteArray();
+            }
+
+            return new StreamData(streamingDataBuffer, playerConfig);
         } catch (IOException ex) {
-            Logger.printException(() -> "Failed to write player response to buffer array", ex);
+            Logger.printException(() -> "Failed to write player response for video stream or details", ex);
             return null;
         }
     }
 
-    private static byte[] fetch(String videoId, Map<String, String> playerHeaders) {
+    private static boolean skipClient(ClientType client) {
+        if (client.requireJS && !supportsJavaScriptEngine()) {
+            Logger.printDebug(() -> "Skipping JavaScript client: " + client.name());
+            return true;
+        }
+        return false;
+    }
+
+    private static StreamData fetch(String videoId, @Nullable Map<String, String> playerHeaders) {
         final boolean debugEnabled = BaseSettings.DEBUG.get();
         final long fetchStartTime = System.currentTimeMillis();
 
         // Retry with different client if empty response body is received.
         int i = 0;
         for (ClientType clientType : clientOrderToUse) {
+            if (skipClient(clientType)) {
+                continue;
+            }
+
             // Show an error if the last client type fails, or if debug is enabled then show for all attempts.
             final boolean showErrorToast = (++i == clientOrderToUse.length) || debugEnabled;
 
             HttpURLConnection connection = send(clientType, videoId, playerHeaders, showErrorToast);
+            Logger.printDebug(() -> "Connection result: " + connection);
             if (connection != null) {
-                byte[] playerResponseBuffer = buildPlayerResponseBuffer(clientType, connection);
+                StreamData playerResponseBuffers = buildPlayerResponseBuffer(clientType, connection);
 
-                if (playerResponseBuffer != null) {
+                if (playerResponseBuffers != null) {
                     lastSpoofedClientType = clientType;
 
                     if (clientType.requireJS) {
@@ -335,7 +364,7 @@ public class StreamingDataRequest {
                                 ", took: " + (System.currentTimeMillis() - fetchStartTime) + "ms");
                     }
 
-                    return playerResponseBuffer;
+                    return playerResponseBuffers;
                 }
             }
         }
@@ -344,28 +373,41 @@ public class StreamingDataRequest {
         handleConnectionError(str("morphe_spoof_video_streams_no_clients_toast"), null, true);
 
         var preferredClient = clientOrderToUse[0];
-        if (preferredClient != ClientType.ANDROID_VR_1_64 && preferredClient != ClientType.ANDROID_VR_1_65
-                && !SharedYouTubeSettings.OAUTH2_REFRESH_TOKEN.get().isBlank()) {
+        if (!preferredClient.supportsOAuth2 && !SharedYouTubeSettings.OAUTH2_REFRESH_TOKEN.get().isBlank()) {
             handleConnectionError(str("morphe_spoof_video_streams_no_clients_suggest_vr_toast"), null, true);
         }
+
         return null;
     }
 
-    public boolean fetchCompleted() {
+    @SuppressWarnings("BooleanMethodIsAlwaysInverted")
+    public boolean fetchIsDone() {
         return future.isDone();
     }
 
     @Nullable
-    public byte[] getStream() {
+    public StreamData getStream() {
         try {
+            // This hook is always called off the main thread,
+            // but this can later be called for the same video ID from the main thread.
+            // This is not a concern, since the fetch will always be finished
+            // and never block the main thread.
+            // But if debugging, then still verify this is the situation.
+            if (BaseSettings.DEBUG.get() && !fetchIsDone() && Utils.isCurrentlyOnMainThread()) {
+                Logger.printException(() -> "Debug: Blocking main thread");
+            }
             return future.get(MAX_MILLISECONDS_TO_WAIT_FOR_FETCH, TimeUnit.MILLISECONDS);
         } catch (TimeoutException ex) {
-            Logger.printInfo(() -> "getStream timed out", ex);
+            Logger.printInfo(() -> "getStreamDetails timed out", ex);
+            future.cancel(true);
+        } catch (CancellationException ex) {
+            Logger.printInfo(() -> "getStreamDetails was previously cancelled");
         } catch (InterruptedException ex) {
-            Logger.printException(() -> "getStream interrupted", ex);
+            Logger.printException(() -> "getStreamDetails interrupted", ex);
+            future.cancel(true);
             Thread.currentThread().interrupt(); // Restore interrupt status flag.
         } catch (ExecutionException ex) {
-            Logger.printException(() -> "getStream failure", ex);
+            Logger.printException(() -> "getStreamDetails failure", ex);
         }
 
         return null;
